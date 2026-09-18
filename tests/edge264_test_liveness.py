@@ -141,6 +141,50 @@ def check_dependency_parity(exe: Path, fixture: Path, timeout: float) -> None:
         )
 
 
+def run_corrupt_slice(exe: Path, fixture: Path, mode: str, stdin: bool, timeout: float) -> bytes:
+    label = f"{fixture.name} {mode} {'stdin' if stdin else 'regular'}"
+    try:
+        completed = subprocess.run(
+            [str(exe), "-" if stdin else str(fixture), mode, "-O", "-k"],
+            input=fixture.read_bytes() if stdin else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"{label} timed out after {timeout:g}s") from exc
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"{label} exited {completed.returncode}\n"
+            f"stderr:\n{completed.stderr.decode(errors='replace')}"
+        )
+    # The position trails decoding by the reorder delay and, multithreaded, by
+    # worker timing, so only its presence is asserted.
+    if b"skipped 1 corrupt NAL unit(s)" not in completed.stderr or not re.search(
+        rb"skipped corrupt NAL unit after output frame \d+\n", completed.stderr
+    ):
+        raise RuntimeError(
+            f"{label} did not report the skipped corrupt slice\n"
+            f"stderr:\n{completed.stderr.decode(errors='replace')}"
+        )
+    return completed.stdout
+
+
+def check_corrupt_dependent_slice(exe: Path, fixture: Path, timeout: float) -> None:
+    # 40 side-by-side stereo pairs of 16x16 macroblocks; the damaged right eye
+    # is concealed from the (flat grey) base view, so every sample stays 128.
+    frame = bytes([128]) * (512 * 256 * 3 // 2)
+    expected = b"YUV4MPEG2 W512 H256 F24000:1001 Ip A1:1 C420mpeg2\n" + (b"FRAME\n" + frame) * 40
+    for mode in ("-s", "-m"):
+        for stdin in (False, True):
+            output = run_corrupt_slice(exe, fixture, mode, stdin, timeout)
+            if output != expected:
+                raise RuntimeError(
+                    f"{fixture.name} {mode} produced {len(output)} bytes, expected {len(expected)}"
+                )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--exe", default="./edge264_test", type=Path)
@@ -171,6 +215,9 @@ def main() -> int:
         dependency_fixture = liveness_dir / name
         check_dependency_parity(exe, dependency_fixture, args.timeout)
         print(f"PASS {name} deterministic concealment")
+    corrupt_fixture = liveness_dir / "mvc_corrupt_dep_slice.264"
+    check_corrupt_dependent_slice(exe, corrupt_fixture, args.timeout)
+    print(f"PASS {corrupt_fixture.name} corrupt dependent slice skipped and concealed")
     return 0
 
 
