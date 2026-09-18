@@ -140,6 +140,8 @@ static int print_passed = 0;
 static int print_unsupported = 0;
 static int enable_yuv = 1;
 static int skip_unsupported = 0;
+static unsigned skipped_corrupt = 0;
+static unsigned long frames_out = 0; // frames delivered so far (per file), to locate a skipped NAL
 static int dump = 0; // 0 off, 1 base view, 2 side-by-side (base|dependent)
 static int y4m_started = 0; // whether the Y4M stream header was written (per file)
 static FILE *msg; // human-readable output: stdout normally, stderr while dumping YUV to stdout
@@ -332,6 +334,7 @@ static int drain_frames(int *res, int *quit)
 	int drained = 0;
 	while (!edge264_get_frame(d, &out, 0)) {
 		drained++;
+		frames_out++;
 		if (dump)
 			dump_frame();
 		if (conf[0] != NULL && check_frame()) {
@@ -353,12 +356,29 @@ static int keep_decoding(int res)
 	// Blu-rays carry per-access-unit unspecified NALs (type 24) that edge264
 	// reports ENOTSUP by design; without this the tool halts at the first one and
 	// never reaches the dependent view.
+	//
+	// It likewise skips a corrupt NAL (EBADMSG), which the API documents as
+	// "decoding may proceed but could show visual artefacts": a rip with one
+	// damaged slice should cost a glitched frame, not the rest of the movie. Only
+	// without a conformance pair, where EBADMSG also reports an output mismatch.
+	if (res == EBADMSG && skip_unsupported && conf[0] == NULL) {
+		// Locate the damage for the user. Output trails decoding by the reorder
+		// delay, so this is the last delivered frame, a few frames before the
+		// damaged one. Bounded so a badly damaged stream cannot flood stderr.
+		if (skipped_corrupt++ < 32)
+			fprintf(stderr, "edge264: skipped corrupt NAL unit after output frame %lu\n", frames_out);
+		return 1;
+	}
 	return res == 0 || res == ENOBUFS || (res == ENOTSUP && skip_unsupported);
 }
 
 static int finish_decode_result(int res, const uint8_t *end1)
 {
 	edge264_flush(d);
+	if (skipped_corrupt > 0) {
+		fprintf(stderr, "edge264: skipped %u corrupt NAL unit(s); output may show brief artefacts\n", skipped_corrupt);
+		skipped_corrupt = 0;
+	}
 	if (res == ENOBUFS || (res == ENODATA && conf[0] != NULL && conf[0] != end1))
 		res = EBADMSG;
 	return res;
@@ -369,6 +389,7 @@ static int decode_mapped_input(const uint8_t *nal, const uint8_t *end0, const ui
 	nal += 3 + (nal[2] == 0); // skip the [0]001 delimiter
 	int res, stuck = 0;
 	y4m_started = 0; // one Y4M stream header per file
+	frames_out = 0;
 	do {
 		const uint8_t *end = edge264_find_start_code(nal, end0, 0);
 		res = edge264_decode_NAL(d, nal, end, NULL, NULL);
@@ -575,6 +596,7 @@ static int decode_stream_input(int fd, const char *name, const uint8_t *end1, in
 	size_t consume = 0;
 	int current = 0, res = 0, stuck = 0;
 	y4m_started = 0; // one Y4M stream header per file
+	frames_out = 0;
 	do {
 		if (!current) {
 			int next = stream_next_nal(&s, &nal, &end, &consume);
@@ -831,7 +853,8 @@ int main(int argc, char *argv[])
 			"-d\tenable display of the videos (requires SDL2)\n"
 			"-f\tprint names of failed files in directory\n"
 			"-k\tkeep decoding past unsupported NALs instead of stopping (e.g. the\n"
-			"\ttype-24 units real 3D Blu-rays carry, which a player skips)\n"
+			"\ttype-24 units real 3D Blu-rays carry, which a player skips), and\n"
+			"\tpast corrupt NALs, reporting how many were skipped\n"
 			"-m\tmulti-threaded decoding, auto-detecting cores (this is the default)\n"
 			"-o\twrite decoded frames as YUV4MPEG2 (Y4M) to stdout for piping to an\n"
 			"\tencoder, e.g. | ffmpeg -i - -c:v libx264 out.mp4 (base view only)\n"

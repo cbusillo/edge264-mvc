@@ -1150,7 +1150,27 @@ static void initialize_task(Edge264Decoder *dec, Edge264SeqParameterSet *sps, Ed
 // writes. The release store publishes the concealed buffers to dependent tasks.
 static void conceal_frame(Edge264Decoder *dec, int id) {
 	assert(dec->samples_buffers[id] && dec->mb_buffers[id]);
-	memset(dec->samples_buffers[id], 0, dec->plane_size_Y + dec->plane_size_C + 16);
+	// A damaged MVC dependent view is best concealed by the base view of its
+	// access unit: the two eyes differ only by disparity, so the viewer sees one
+	// flat frame instead of a green flash, and the pictures predicted from it
+	// inherit a plausible reference rather than neutral samples. Take the most
+	// recent live base picture with the same POC, and only once it is complete
+	// so no worker still writes it. Otherwise fall back to neutral samples.
+	int base = -1;
+	if (dec->non_base_frames >> id & 1) {
+		unsigned live = (dec->short_term_frames | dec->long_term_frames | dec->to_get_frames | dec->output_frames) &
+			~dec->non_base_frames & ready_frames(dec);
+		for (unsigned b = live; b; b &= b - 1) {
+			int i = __builtin_ctz(b);
+			if (dec->samples_buffers[i] && dec->FieldOrderCnt[0][i] == dec->FieldOrderCnt[0][id] &&
+				(base < 0 || dec->FrameIds[i] > dec->FrameIds[base]))
+				base = i;
+		}
+	}
+	if (base >= 0)
+		memcpy(dec->samples_buffers[id], dec->samples_buffers[base], dec->plane_size_Y + dec->plane_size_C + 16);
+	else
+		memset(dec->samples_buffers[id], 0, dec->plane_size_Y + dec->plane_size_C + 16);
 	int width = dec->sps.pic_width_in_mbs;
 	int height = dec->sps.pic_height_in_mbs;
 	int mbs = (width + 1) * height - 1;
@@ -1292,8 +1312,33 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 		log_dec(dec, "  idr_pic_id: %u\n", idr_pic_id);
 	}
 	
-	// detect the start of a new frame (7.4.1.2.4)
+	// An access unit holds a single view component per view (H.7.4.1.2.4), so
+	// while a dependent picture is open an inter-coded type-20 slice normally
+	// continues it. One that instead starts a new picture is either the next
+	// dependent of a stream that lost its base view (frame_num advances by at
+	// most one - see tests/liveness/mvc_orphan_*), or a slice with a corrupt
+	// header, e.g. a damaged right-eye slice on a 3D Blu-ray rip whose base view
+	// stays intact. The latter shows as a frame_num gap. Accepting it closes the
+	// open picture, inserts non-existing frames and seeds PrevRefFrameNum and
+	// prevPicOrderCnt of the dependent view with garbage; every later dependent
+	// POC then mismatches its base, the base-driven pairing in bump_frame never
+	// queues them, and the DPB fills until decode_NAL returns ENOBUFS forever.
+	// Reject such a slice before it alters any state, so the remaining slices of
+	// the open picture still decode. Inert for well-formed MVC, where a base
+	// picture always closes the dependent one first.
 	int FrameNumMask = (1 << sps->log2_max_frame_num) - 1;
+	int dep_corrupt = 0;
+	if (dec->nal_unit_type == 20 && t->slice_type < 2 && dec->currPic >= 0 &&
+		(dec->non_base_frames >> dec->currPic & 1)) {
+		int prev = ((dec->short_term_frames | dec->long_term_frames) >> dec->currPic & 1) ?
+			dec->FrameNums[dec->currPic] : dec->PrevRefFrameNum[1];
+		dep_corrupt = ((frame_num - prev - 1) & FrameNumMask) > 0;
+	}
+
+	// detect the start of a new frame (7.4.1.2.4)
+	if (dep_corrupt && (frame_num != (dec->FrameNum & FrameNumMask) ||
+		(dec->nal_ref_idc > 0) != ((dec->short_term_frames | dec->long_term_frames) >> dec->currPic & 1)))
+		return print_dec(dec, "  decode_NAL_result: %s\n", EBADMSG);
 	if (dec->currPic >= 0 && (frame_num != (dec->FrameNum & FrameNumMask) ||
 		(dec->nal_ref_idc > 0) != ((dec->short_term_frames | dec->long_term_frames) >> dec->currPic & 1) ||
 		(dec->nal_unit_type == 20) != (dec->non_base_frames >> dec->currPic & 1) ||
@@ -1332,8 +1377,11 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 	if (sps->pic_order_cnt_type == 0) {
 		int pic_order_cnt_lsb = get_uv(&dec->gb, sps->log2_max_pic_order_cnt_lsb);
 		int shift = WORD_BIT - sps->log2_max_pic_order_cnt_lsb;
-		if (dec->currPic >= 0 && pic_order_cnt_lsb != ((unsigned)dec->TopFieldOrderCnt << shift >> shift))
+		if (dec->currPic >= 0 && pic_order_cnt_lsb != ((unsigned)dec->TopFieldOrderCnt << shift >> shift)) {
+			if (dep_corrupt)
+				return print_dec(dec, "  decode_NAL_result: %s\n", EBADMSG);
 			unset_currPic(dec);
+		}
 		// unset_currPic must happen before prevPicOrderCnt to get an up-to-date value
 		int PrevRefFrameNum = dec->PrevRefFrameNum[non_base_view];
 		dec->FrameNum = PrevRefFrameNum + 1 + ((frame_num - PrevRefFrameNum - 1) & FrameNumMask);
@@ -1359,8 +1407,11 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 				log_dec(dec, ", delta1: %d", delta_pic_order_cnt1);
 			}
 		}
-		if (dec->currPic >= 0 && delta_pic_order_cnt0 != dec->delta_pic_order_cnt0)
+		if (dec->currPic >= 0 && delta_pic_order_cnt0 != dec->delta_pic_order_cnt0) {
+			if (dep_corrupt)
+				return print_dec(dec, "  decode_NAL_result: %s\n", EBADMSG);
 			unset_currPic(dec);
+		}
 		dec->delta_pic_order_cnt0 = delta_pic_order_cnt0;
 		// unset_currPic must happen before PrevRefFrameNum to get a definitive value
 		int PrevRefFrameNum = dec->PrevRefFrameNum[non_base_view];
