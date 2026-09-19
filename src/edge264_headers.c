@@ -1148,21 +1148,30 @@ static void initialize_task(Edge264Decoder *dec, Edge264SeqParameterSet *sps, Ed
 // macroblock metadata before publishing it as complete. The caller holds lock,
 // and only selects slots with no in-flight task, so no worker can race these
 // writes. The release store publishes the concealed buffers to dependent tasks.
+// The MVC path below additionally READS another frame's sample buffer; that read
+// is gated on ready_frames, an acquire load of the completion flag that pairs
+// with the release store of the worker that last wrote the frame.
 static void conceal_frame(Edge264Decoder *dec, int id) {
 	assert(dec->samples_buffers[id] && dec->mb_buffers[id]);
 	// A damaged MVC dependent view is best concealed by the base view of its
 	// access unit: the two eyes differ only by disparity, so the viewer sees one
 	// flat frame instead of a green flash, and the pictures predicted from it
-	// inherit a plausible reference rather than neutral samples. Take the most
-	// recent live base picture with the same POC, and only once it is complete
-	// so no worker still writes it. Otherwise fall back to neutral samples.
+	// inherit a plausible reference rather than neutral samples. Identify that
+	// base on (FrameNum, POC), the same key the pairing in bump_frame uses - a
+	// POC-only match collides across short IDR sequences, where pictures of
+	// different sequences share a full POC while carrying different frame_num
+	// (tests/gen_same_poc_stream.py), and would fill the damaged eye from another
+	// access unit: a stale picture presented as the other eye, worse than the
+	// neutral samples it replaces. Only take a complete base, so no worker still
+	// writes it. Otherwise fall back to neutral samples.
 	int base = -1;
 	if (dec->non_base_frames >> id & 1) {
 		unsigned live = (dec->short_term_frames | dec->long_term_frames | dec->to_get_frames | dec->output_frames) &
 			~dec->non_base_frames & ready_frames(dec);
 		for (unsigned b = live; b; b &= b - 1) {
 			int i = __builtin_ctz(b);
-			if (dec->samples_buffers[i] && dec->FieldOrderCnt[0][i] == dec->FieldOrderCnt[0][id] &&
+			if (dec->samples_buffers[i] && dec->FrameNums[i] == dec->FrameNums[id] &&
+				dec->FieldOrderCnt[0][i] == dec->FieldOrderCnt[0][id] &&
 				(base < 0 || dec->FrameIds[i] > dec->FrameIds[base]))
 				base = i;
 		}
@@ -1314,24 +1323,32 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 	
 	// An access unit holds a single view component per view (H.7.4.1.2.4), so
 	// while a dependent picture is open an inter-coded type-20 slice normally
-	// continues it. One that instead starts a new picture is either the next
-	// dependent of a stream that lost its base view (frame_num advances by at
-	// most one - see tests/liveness/mvc_orphan_*), or a slice with a corrupt
-	// header, e.g. a damaged right-eye slice on a 3D Blu-ray rip whose base view
-	// stays intact. The latter shows as a frame_num gap. Accepting it closes the
-	// open picture, inserts non-existing frames and seeds PrevRefFrameNum and
-	// prevPicOrderCnt of the dependent view with garbage; every later dependent
-	// POC then mismatches its base, the base-driven pairing in bump_frame never
-	// queues them, and the DPB fills until decode_NAL returns ENOBUFS forever.
-	// Reject such a slice before it alters any state, so the remaining slices of
-	// the open picture still decode. Inert for well-formed MVC, where a base
-	// picture always closes the dependent one first.
+	// continues it. dep_corrupt below is exactly that test: it holds when the
+	// slice's frame_num is NOT one a new picture could legally carry here, i.e.
+	// the slice claims to continue the open picture. If a new-picture trigger
+	// then fires anyway - a differing POC or nal_ref_idc, or an IDR whose
+	// frame_num 7.4.3 forces to 0 - the header is damaged rather than the start
+	// of a picture. That is the shape a 3D Blu-ray rip has when one right-eye
+	// slice is corrupted while its base view stays intact. Accepting such a slice
+	// closes the open picture, inserts non-existing frames and seeds
+	// PrevRefFrameNum and prevPicOrderCnt of the dependent view with garbage;
+	// every later dependent POC then mismatches its base, the base-driven pairing
+	// in bump_frame never queues them, and the DPB fills until decode_NAL returns
+	// ENOBUFS forever. Reject it before it alters any state, so the remaining
+	// slices of the open picture still decode. Inert for well-formed MVC, where a
+	// base picture always closes the dependent one first, and for a stream that
+	// merely lost its base view, whose dependent pictures follow each other with
+	// frame_num advancing by one (tests/liveness/mvc_orphan_*). The exception is
+	// an anchor (IDR) dependent picture reached with no base view of its own
+	// access unit: its frame_num of 0 lands here and is rejected, which is the
+	// wanted outcome - the inter-view reference it predicts from is gone, so the
+	// alternative is decoding it against a stale base of an earlier access unit.
 	int FrameNumMask = (1 << sps->log2_max_frame_num) - 1;
 	int dep_corrupt = 0;
 	if (dec->nal_unit_type == 20 && t->slice_type < 2 && dec->currPic >= 0 &&
 		(dec->non_base_frames >> dec->currPic & 1)) {
 		int prev = ((dec->short_term_frames | dec->long_term_frames) >> dec->currPic & 1) ?
-			dec->FrameNums[dec->currPic] : dec->PrevRefFrameNum[1];
+			dec->FrameNums[dec->currPic] : dec->PrevRefFrameNum[non_base_view];
 		dep_corrupt = ((frame_num - prev - 1) & FrameNumMask) > 0;
 	}
 

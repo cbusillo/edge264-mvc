@@ -497,6 +497,7 @@ Multithreaded decoding is the headline addition. Call `edge264_alloc` with `n_th
 | Tolerate a VUI that over-reads past the SPS rbsp | whole stream dropped over a common encoder defect |
 | Tolerate a CABAC slice that over-reads past its NAL when complete | a dense 4K multi-slice CABAC frame stalled mid-stream |
 | Tolerate non-1 `cabac_alignment_one_bit` padding | every slice rejected -> mid-stream stall, 0 frames |
+| Reject a corrupt MVC dependent-view slice header instead of taking it for a new picture (`parse_slice_layer_without_partitioning`), and conceal the damaged dependent picture from the base view of its access unit rather than with neutral samples | one damaged dependent-view slice on an otherwise intact 3D stream was read as a new dependent picture after a `frame_num` gap, which seeded the dependent view's `PrevRefFrameNum` / `prevPicOrderCnt` with garbage; every later dependent POC then mismatched its base, the base-driven pairing never queued them, and `edge264_decode_NAL` returned `ENOBUFS` forever with nothing left to drain - a caller spun at 100% CPU on a file, or took the jam for end-of-stream and silently truncated the video when fed from a pipe |
 | Reject a slice whose `first_mb_in_slice` is outside the current picture | out-of-bounds macroblock write / crash when interleaved multi-resolution streams (e.g. main + secondary/PiP video) reach one decoder |
 | Fall back to the Default scaling matrices (Fall-Back Rule Set A, Table 7-2) when a PPS declares `pic_scaling_matrix_present_flag = 1` with absent lists over a `seq_scaling_matrix_present_flag = 0` SPS | the absent PPS lists inherited the SPS's `Flat_16` instead of the spec-mandated `Default_4x4`/`Default_8x8` weighting, so a High Profile stream using this (legal, common) combination dequantized every coefficient wrong - whole-picture colour-block corruption that a commercial 3D Blu-ray's MVC stream showed in **both** views (the base view is mis-decoded in the plain AVC path, and the dependent view inherits it through inter-view prediction) |
 
@@ -550,7 +551,7 @@ Multithreaded decoding is the headline addition. Call `edge264_alloc` with `n_th
   matching stock edge264's tested contract. Skip them in your decode loop rather than treating them
   as fatal (a caller-side concern, not a library change).
 
-Credits: [@intrepidsilence](https://github.com/intrepidsilence) and [@vkapartzianis](https://github.com/vkapartzianis) for the edge264 PRs / patches this project builds on, and Thibault Raffaillac (tvlabs) for edge264 itself.
+Credits: [@intrepidsilence](https://github.com/intrepidsilence) and [@vkapartzianis](https://github.com/vkapartzianis) for the edge264 PRs / patches this project builds on, [@cbusillo](https://github.com/cbusillo) for contributions to this fork, and Thibault Raffaillac (tvlabs) for edge264 itself.
 
 
 ## Contributing
