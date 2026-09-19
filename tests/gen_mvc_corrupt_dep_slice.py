@@ -16,17 +16,23 @@
 # state, its picture is concealed from the base view, and all BODY stereo pairs
 # are delivered, identically in single- and multi-threaded decoding.
 #
-# With "idr_pic_id" the stream instead restarts with an IDR access unit every
-# IDR_EVERY AUs, and the damaged slice belongs to a dependent IDR picture: its
-# frame_num and pic_order_cnt stay intact and only idr_pic_id is garbage. The
-# slice is intra, so the frame_num test cannot see it; the decoder used to open
-# a second dependent picture with the (FrameNum, POC) of the first, which never
-# paired with a base, and jammed the same way.
+# The other modes restart with an IDR access unit every IDR_EVERY AUs, so the
+# damaged slice belongs to a dependent IDR picture. That slice is intra, so the
+# frame_num test cannot see it, and exactly one syntax element is garbage while
+# frame_num and everything else stay intact - "idr_pic_id", "nal_ref_idc" or
+# "pic_order_cnt". Each on its own used to open a second dependent picture with
+# the (FrameNum, POC) of the first, which never paired with a base, and jammed
+# the same way. They are separate fixtures because they enter the new-picture
+# detection through three different triggers.
 #
-# Usage: gen_mvc_corrupt_dep_slice.py <out.yaml> [idr_pic_id]
+# Usage: gen_mvc_corrupt_dep_slice.py <out.yaml> [idr_pic_id|nal_ref_idc|pic_order_cnt]
 import sys
 
-IDR_DAMAGE = sys.argv[2:] == ["idr_pic_id"]
+MODES = ("slice_header", "idr_pic_id", "nal_ref_idc", "pic_order_cnt")
+MODE = sys.argv[2] if len(sys.argv) > 2 else MODES[0]
+if MODE not in MODES:
+    sys.exit("usage: gen_mvc_corrupt_dep_slice.py <out.yaml> [%s]" % "|".join(MODES[1:]))
+IDR_DAMAGE = MODE != MODES[0]
 
 W, H = 16, 16                 # picture size in macroblocks
 NMBS = W * H
@@ -40,7 +46,7 @@ def block(lines):
 
 out = [block([
     "--- # MVC stream with one corrupt dependent-view %s (AU %d of %d)." % (
-        "idr_pic_id" if IDR_DAMAGE else "slice header", BAD_AU, BODY),
+        "slice header" if MODE == MODES[0] else MODE, BAD_AU, BODY),
     "# See tests/gen_mvc_corrupt_dep_slice.py. Expected: %d stereo pairs." % BODY])]
 # SPS (base view): level 1.2 keeps the derived DPB small (MaxDpbMbs 891 / 256
 # MBs = 3 frames), so the tail reaches the immediate-output fullness path early.
@@ -128,16 +134,16 @@ def base_slice(i):
         "  num_ref_idx_active: {override_flag: 0, l0: 1}",
         "  slice_qp_delta: 0"] + skip_mbs(NMBS))
 
-def dep_slice(i, first_mb, n, frame_num, poc, idr_pic_id):
+def dep_slice(i, first_mb, n, frame_num, poc, idr_pic_id, nal_ref_idc=3):
     if i % IDR_EVERY == 0:
         return block([
-            "- nal_ref_idc: 3", "  nal_unit_type: 20", "  non_idr_flag: 0",
+            "- nal_ref_idc: %d" % nal_ref_idc, "  nal_unit_type: 20", "  non_idr_flag: 0",
             "  priority_id: 0", "  view_id: 1", "  temporal_id: 0",
             "  anchor_pic_flag: 1", "  inter_view_flag: 0",
             "  first_mb_in_slice: %d" % first_mb,
             "  slice_type: 2", "  pic_parameter_set_id: 1",
             "  frame_num: {bits: %d, absolute: 0}" % BITS, "  idr_pic_id: %d" % idr_pic_id,
-            "  pic_order_cnt: {type: 0, bits: %d, absolute: 0}" % BITS,
+            "  pic_order_cnt: {type: 0, bits: %d, absolute: %d}" % (BITS, poc),
             "  no_output_of_prior_pics_flag: 0", "  long_term_reference_flag: 0",
             "  slice_qp_delta: 0"] + intra_mbs(n))
     return block([
@@ -159,8 +165,12 @@ for i in range(BODY):
     out.append(dep_slice(i, 0, NMBS // 2, fn, 2 * fn, idr))
     if i != BAD_AU:
         out.append(dep_slice(i, NMBS // 2, NMBS // 2, fn, 2 * fn, idr))
-    elif IDR_DAMAGE:
+    elif MODE == "idr_pic_id":
         out.append(dep_slice(i, NMBS // 2, NMBS // 2, fn, 2 * fn, idr + 4321))
+    elif MODE == "nal_ref_idc":
+        out.append(dep_slice(i, NMBS // 2, NMBS // 2, fn, 2 * fn, idr, nal_ref_idc=0))
+    elif MODE == "pic_order_cnt":
+        out.append(dep_slice(i, NMBS // 2, NMBS // 2, fn, 2 * fn + 90, idr))
     else:
         out.append(dep_slice(i, NMBS // 2, NMBS // 2, fn + 100, 2 * fn + 90, idr))
 

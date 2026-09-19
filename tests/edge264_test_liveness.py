@@ -226,6 +226,8 @@ def main() -> int:
     for name in (
         "mvc_corrupt_dep_slice.264",
         "mvc_corrupt_dep_idr_pic_id.264",
+        "mvc_corrupt_dep_nal_ref_idc.264",
+        "mvc_corrupt_dep_poc.264",
     ):
         corrupt_fixture = liveness_dir / name
         check_corrupt_dependent_slice(exe, corrupt_fixture, args.timeout)

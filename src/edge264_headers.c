@@ -1352,31 +1352,37 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 		dep_corrupt = ((frame_num - prev - 1) & FrameNumMask) > 0;
 	}
 
-	// The test above excludes intra slices, so it cannot see the same damage one
-	// syntax element over: a slice of an open dependent IDR picture whose
-	// idr_pic_id alone is corrupt. frame_num (forced to 0) and nal_ref_idc still
-	// match, so idr_pic_id is the only new-picture trigger left. Accepting it
-	// closes the open picture and opens a second dependent picture carrying the
-	// same (FrameNum, POC) as the first; the base of the access unit pairs with
-	// one of them, the other is never queued by bump_frame, and the DPB jams as
-	// above. A slice that genuinely opens a picture starts at macroblock 0 - ASO
-	// is not allowed in the MVC profiles - so one that starts further in, right
-	// where the open picture continues, is a damaged continuation. Reject it
-	// before it alters any state. Inert for a stream of dependent IDR pictures
-	// that lost its base view, whose pictures each begin at macroblock 0.
-	if (dec->nal_unit_type == 20 && dec->currPic >= 0 &&
-		(dec->non_base_frames >> dec->currPic & 1) &&
-		idr_pic_id >= 0 && dec->idr_pic_id >= 0 && idr_pic_id != dec->idr_pic_id &&
-		t->first_mb_in_slice > 0 && frame_num == (dec->FrameNum & FrameNumMask) &&
-		(dec->nal_ref_idc > 0) == ((dec->short_term_frames | dec->long_term_frames) >> dec->currPic & 1))
-		return print_dec(dec, "  decode_NAL_result: %s\n", EBADMSG);
+	// dep_corrupt keys on frame_num, so it only sees damage that frame_num itself
+	// reveals, and only on an inter slice. The same jam is reachable through every
+	// other new-picture trigger: an intra slice of an open dependent IDR picture
+	// whose idr_pic_id, nal_ref_idc or pic_order_cnt alone is corrupt opens a
+	// second dependent picture carrying the same (FrameNum, POC) as the first; the
+	// base of the access unit pairs with one of them, the other is never queued by
+	// bump_frame, and the DPB jams exactly as above. dep_continuation catches the
+	// whole family at once, on the invariant that makes it impossible in a
+	// conformant stream: arbitrary slice order is not allowed in either MVC
+	// profile (H.10.1.1 and H.10.1.2 both state it), so by 7.4.3 the slices of a
+	// picture arrive with non-decreasing first_mb_in_slice and a picture's first
+	// slice always addresses macroblock 0. A type-20 slice that starts further in,
+	// right where the open dependent picture continues, therefore cannot be the
+	// start of a new picture - if a new-picture trigger fires on it, the header is
+	// damaged. Reject it before it alters any state, so the remaining slices of
+	// the open picture still decode. Inert for well-formed MVC at any slice count,
+	// and for a stream that merely lost its base view, whose dependent pictures
+	// each begin at macroblock 0.
+	int dep_continuation = dec->nal_unit_type == 20 && dec->currPic >= 0 &&
+		(dec->non_base_frames >> dec->currPic & 1) && t->first_mb_in_slice > 0;
 
 	// detect the start of a new frame (7.4.1.2.4)
-	if (dep_corrupt && (frame_num != (dec->FrameNum & FrameNumMask) ||
-		(dec->nal_ref_idc > 0) != ((dec->short_term_frames | dec->long_term_frames) >> dec->currPic & 1)))
+	int frame_num_changed = dec->currPic >= 0 && frame_num != (dec->FrameNum & FrameNumMask);
+	int nal_ref_idc_changed = dec->currPic >= 0 && (dec->nal_ref_idc > 0) !=
+		((dec->short_term_frames | dec->long_term_frames) >> dec->currPic & 1);
+	if (dep_corrupt && (frame_num_changed || nal_ref_idc_changed))
 		return print_dec(dec, "  decode_NAL_result: %s\n", EBADMSG);
-	if (dec->currPic >= 0 && (frame_num != (dec->FrameNum & FrameNumMask) ||
-		(dec->nal_ref_idc > 0) != ((dec->short_term_frames | dec->long_term_frames) >> dec->currPic & 1) ||
+	if (dep_continuation && (frame_num_changed || nal_ref_idc_changed ||
+		idr_pic_id != dec->idr_pic_id))
+		return print_dec(dec, "  decode_NAL_result: %s\n", EBADMSG);
+	if (dec->currPic >= 0 && (frame_num_changed || nal_ref_idc_changed ||
 		(dec->nal_unit_type == 20) != (dec->non_base_frames >> dec->currPic & 1) ||
 		idr_pic_id != dec->idr_pic_id)) {
 		unset_currPic(dec);
@@ -1414,7 +1420,7 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 		int pic_order_cnt_lsb = get_uv(&dec->gb, sps->log2_max_pic_order_cnt_lsb);
 		int shift = WORD_BIT - sps->log2_max_pic_order_cnt_lsb;
 		if (dec->currPic >= 0 && pic_order_cnt_lsb != ((unsigned)dec->TopFieldOrderCnt << shift >> shift)) {
-			if (dep_corrupt)
+			if (dep_corrupt || dep_continuation)
 				return print_dec(dec, "  decode_NAL_result: %s\n", EBADMSG);
 			unset_currPic(dec);
 		}
@@ -1444,7 +1450,7 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 			}
 		}
 		if (dec->currPic >= 0 && delta_pic_order_cnt0 != dec->delta_pic_order_cnt0) {
-			if (dep_corrupt)
+			if (dep_corrupt || dep_continuation)
 				return print_dec(dec, "  decode_NAL_result: %s\n", EBADMSG);
 			unset_currPic(dec);
 		}
