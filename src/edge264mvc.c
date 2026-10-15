@@ -1042,12 +1042,22 @@ static void export_frame(Edge264MvcDecoder *dec, const Edge264MvcOutput *f, Edge
 	out->handle = f->return_arg;
 }
 
+// get_frame, returning the frames displayed before the picture decoding resumed
+// at (leading_frames) at once instead, which the caller never sees. Dropping
+// them is the progress an EDGE264MVC_AGAIN round promises, as it frees slots.
+static int get_output_frame(Edge264MvcDecoder *dec, Edge264MvcOutput *f) {
+	int ret;
+	while ((ret = get_frame(dec, f, 1)) == 0 && (handle_frames(f->return_arg) & dec->leading_frames))
+		return_frame(dec, f->return_arg);
+	return ret;
+}
+
 int edge264mvc_receive_frame(Edge264MvcDecoder *dec, Edge264MvcFrame *frame) {
 	if (dec == NULL || frame == NULL)
 		return EDGE264MVC_INVALID;
 	for (int drains = 0;; ) {
 		Edge264MvcOutput f;
-		if (get_frame(dec, &f, 1) == 0) {
+		if (get_output_frame(dec, &f) == 0) {
 			export_frame(dec, &f, frame);
 			dec->want_frame = 0;
 			return EDGE264MVC_OK;
@@ -1059,7 +1069,7 @@ int edge264mvc_receive_frame(Edge264MvcDecoder *dec, Edge264MvcFrame *frame) {
 			// without any frame end it too.
 			static const uint8_t sentinel = 0; // an empty buffer triggers the drain
 			int ret = decode_nal(dec, &sentinel, &sentinel, 0, 0);
-			if (get_frame(dec, &f, 1) == 0) {
+			if (get_output_frame(dec, &f) == 0) {
 				export_frame(dec, &f, frame);
 				return EDGE264MVC_OK;
 			}
@@ -1091,7 +1101,7 @@ int edge264mvc_receive_frame(Edge264MvcDecoder *dec, Edge264MvcFrame *frame) {
 			pthread_mutex_unlock(&dec->lock);
 			if (busy)
 				continue;
-			if (get_frame(dec, &f, 1) == 0) {
+			if (get_output_frame(dec, &f) == 0) {
 				export_frame(dec, &f, frame);
 				dec->want_frame = 0;
 				return EDGE264MVC_OK;

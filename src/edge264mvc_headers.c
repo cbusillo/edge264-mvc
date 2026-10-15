@@ -1252,6 +1252,8 @@ static void parse_dec_ref_pic_marking(Edge264MvcDecoder *dec, Edge264MvcSeqParam
 				int tempPicOrderCnt = minw(dec->TopFieldOrderCnt, dec->BottomFieldOrderCnt);
 				dec->FieldOrderCnt[0][dec->currPic] = (int)((unsigned)dec->TopFieldOrderCnt - tempPicOrderCnt);
 				dec->FieldOrderCnt[1][dec->currPic] = (int)((unsigned)dec->BottomFieldOrderCnt - tempPicOrderCnt);
+				dec->resume_state = 2; // the POCs restart, so no later picture precedes the resume point
+				dec->leading_frames &= ~((FrameMask)1 << dec->currPic);
 				while (bump_frame(dec, dec->nal_unit_type == 20, (FrameMask)1 << dec->currPic));
 			}
 			// one format per operation, since a format may not skip an argument
@@ -2402,6 +2404,18 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264MvcDecoder *dec, 
 		dec->FrameNums[currPic] = dec->FrameNum;
 		dec->FieldOrderCnt[0][currPic] = dec->TopFieldOrderCnt;
 		dec->FieldOrderCnt[1][currPic] = dec->BottomFieldOrderCnt;
+		// Decoding resumes at the first picture after open or a flush. When that
+		// is not an IDR picture (a seek to the I picture of an open GOP), the
+		// pictures displayed before it predict from pictures that were never
+		// decoded: they are decoded, since later ones of them may predict from
+		// them, but never output, until an IDR picture or mmco5 restarts the
+		// POCs. The views of one access unit share a POC, so both are left out.
+		if (dec->IdrPicFlag)
+			dec->resume_state = 2;
+		else if (dec->resume_state == 0)
+			dec->resume_state = 1, dec->resume_poc = dec->TopFieldOrderCnt;
+		int leading = dec->resume_state == 1 && dec->TopFieldOrderCnt < dec->resume_poc;
+		dec->leading_frames = dec->leading_frames & ~((FrameMask)1 << currPic) | (FrameMask)leading << currPic;
 		dec->remaining_mbs[currPic] = sps->pic_width_in_mbs * sps->pic_height_in_mbs;
 		__atomic_store_n(&dec->next_deblock_addr[currPic], 0, __ATOMIC_RELEASE);
 		// forget the slices a previous picture in this slot left to deblock

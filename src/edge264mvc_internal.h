@@ -672,6 +672,8 @@ struct Edge264MvcDecoder {
 	int8_t sS; // last decoded timestamp seconds, 0..59
 	int8_t flushing; // set while draining at end-of-stream (buf>=end); lets get_frame emit an unpairable MVC base alone instead of deadlocking
 	int8_t shutdown; // set by free_decoder to make idle worker threads exit their wait loop for a clean join before destroying mutex/conds
+	int8_t resume_state; // 0 before the first picture since open or a flush, 1 while that picture was not an IDR picture (see leading_frames), 2 once an IDR picture or mmco5 restarted the POCs
+	int32_t resume_poc; // POC of the first picture since open or a flush, while resume_state is 1
 	int32_t FrameNum; // value for the current incomplete frame, unaffected by mmco5
 	int32_t PrevRefFrameNum[2]; // one per view
 	int32_t idr_pic_id; // value for the last slice, used for detecting new frames
@@ -692,6 +694,7 @@ struct Edge264MvcDecoder {
 	FrameMask to_get_frames; // bitfield for frames waiting to be output
 	FrameMask output_frames; // bitfield for frames that are owned by the caller after get_frame and not yet returned
 	FrameMask non_base_frames; // bitfield for frames that are non-base views in MVC
+	FrameMask leading_frames; // bitfield for frames displayed before the non-IDR picture decoding resumed at, decoded but never output
 	FrameMask prev_short_term_frames; // state of short_term_frames for both views before current frame
 	FrameMask prev_long_term_frames; // state of long_term_frames for both views before current frame
 	int32_t FrameNums[MAX_FRAMES]; // signed to be used along FieldOrderCnt in initial reference ordering

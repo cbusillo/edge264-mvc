@@ -7,14 +7,16 @@
 // pts / user_data passthrough, and a caller that holds its latest frame
 // while it sends the next NALs - through an end of sequence and a change of
 // the frame size - and the frame size limit max_frame_pixels, at the size of
-// each stream's frames after cropping and one below. It uses committed MVC
-// and 2D streams, two of them cropped, each single-threaded and with
-// EDGE264MVC_THREADS worker threads. The struct layouts are checked when it is
-// compiled.
+// each stream's frames after cropping and one below, and a seek to an I picture
+// that is not an IDR picture. It uses committed MVC and 2D streams, two of
+// them cropped, each single-threaded and with EDGE264MVC_THREADS worker
+// threads. The struct layouts are checked when it is compiled.
 //
-// Usage: api_check <stream.264>... (the held-frame check uses the last stream,
-// an end of sequence, the last stream again, then the first one, which must
-// differ from it in frame size)
+// Usage: api_check <stream.264>... [--seek <stream.264>...] (the held-frame
+// check uses the last stream before --seek, an end of sequence, that stream
+// again, then the first one, which must differ from it in frame size; the
+// streams after --seek are the ones whose first non-IDR I picture no later
+// picture predicts across, so decoding can resume there)
 
 #include <stddef.h>
 #include <stdint.h>
@@ -239,6 +241,108 @@ static void check_held_frame(const char *path_a, const char *path_b, int n_threa
 	free(a), free(b), free(buf);
 }
 
+// Reads one Exp-Golomb code at the start of a slice header, where no
+// emulation prevention byte can occur yet.
+static unsigned read_ue(const uint8_t *p, size_t size, size_t *bit) {
+	int zeros = 0;
+	while (*bit < size * 8 && !(p[*bit >> 3] >> (7 - (*bit & 7)) & 1))
+		zeros++, (*bit)++;
+	(*bit)++;
+	unsigned v = 1;
+	for (int i = 0; i < zeros && *bit < size * 8; i++, (*bit)++)
+		v = v << 1 | (p[*bit >> 3] >> (7 - (*bit & 7)) & 1);
+	return v - 1;
+}
+
+typedef struct {
+	int frames;
+	uint64_t hash[1024];
+	int32_t decode_order[1024];
+} Frames;
+
+static void receive_frames(Edge264MvcDecoder *dec, Frames *o) {
+	Edge264MvcFrame f;
+	while (edge264mvc_receive_frame(dec, &f) == EDGE264MVC_OK) {
+		if (o->frames < 1024) {
+			o->hash[o->frames] = hash_frame(&f);
+			o->decode_order[o->frames] = f.views[0].decode_order;
+		}
+		o->frames++;
+		edge264mvc_release_frame(dec, &f);
+	}
+}
+
+// Sends the NALs starting in [from, to), only the parameter sets if asked.
+static void send_nals(Edge264MvcDecoder *dec, const uint8_t *buf, size_t size, size_t from, size_t to, int parameter_sets, Frames *o) {
+	for (size_t pos = from + edge264mvc_find_start_code(buf + from, size - from), next; pos < to; pos = next) {
+		size_t start = pos + 3;
+		next = start + edge264mvc_find_start_code(buf + start, size - start);
+		int type = buf[start] & 31;
+		if (parameter_sets && type != 7 && type != 8 && type != 15)
+			continue;
+		for (int rounds = 0; edge264mvc_send_nal(dec, buf + start, next - start, 0, 0) == EDGE264MVC_AGAIN && rounds < 64; rounds++)
+			receive_frames(dec, o);
+		receive_frames(dec, o);
+	}
+}
+
+// A seek to an I picture that is not an IDR picture: flush, then the parameter
+// sets, then the stream from that picture's access unit on. Decoding resumes
+// there, so the picture is the first one out - the pictures displayed before
+// it predict from pictures that were never sent (an open GOP) - and every
+// picture that comes out equals the one decoded from the start of the stream.
+static void check_seek(const char *path, int n_threads) {
+	size_t size = 0;
+	uint8_t *buf = load_file(path, &size);
+	if (buf == NULL)
+		return;
+	size_t entry = 0, prev_pos = 0;
+	int prev_type = 0;
+	for (size_t pos = edge264mvc_find_start_code(buf, size), next; pos < size && entry == 0; pos = next) {
+		size_t start = pos + 3;
+		next = start + edge264mvc_find_start_code(buf + start, size - start);
+		int type = buf[start] & 31;
+		if (type == 1) {
+			size_t bit = 8;
+			unsigned first_mb_in_slice = read_ue(buf + start, next - start, &bit);
+			unsigned slice_type = read_ue(buf + start, next - start, &bit) % 5;
+			if (first_mb_in_slice == 0 && slice_type == 2)
+				entry = prev_type == 14 ? prev_pos : pos; // with the prefix of an MVC base view
+		}
+		prev_pos = pos, prev_type = type;
+	}
+	Edge264MvcSettings settings;
+	edge264mvc_default_settings(&settings);
+	settings.n_threads = n_threads;
+	Edge264MvcDecoder *dec = NULL;
+	Frames *all = calloc(2, sizeof(Frames)), *seek = all + 1;
+	if (entry == 0 || all == NULL || edge264mvc_open(&dec, &settings) != EDGE264MVC_OK) {
+		free(all), free(buf);
+		return;
+	}
+	send_nals(dec, buf, size, 0, size, 0, all);
+	edge264mvc_send_end(dec);
+	receive_frames(dec, all);
+	edge264mvc_flush(dec);
+	send_nals(dec, buf, size, 0, entry, 1, seek);
+	send_nals(dec, buf, size, entry, size, 0, seek);
+	edge264mvc_send_end(dec);
+	receive_frames(dec, seek);
+	edge264mvc_close(&dec);
+	int first = 0;
+	for (int i = 1; i < seek->frames && i < 1024; i++)
+		first = seek->decode_order[i] < seek->decode_order[first] ? i : first;
+	CHECK(first == 0, "%s (%d threads): after a seek to an I picture, %d pictures displayed before it came out",
+		path, n_threads, first);
+	int tail = all->frames - seek->frames, differ = 0;
+	for (int i = 0; i < seek->frames && tail >= 0 && i < 1024; i++)
+		differ += seek->hash[i] != all->hash[tail + i];
+	CHECK(seek->frames > 0 && tail >= 0 && differ == 0,
+		"%s (%d threads): after a seek to an I picture, %d frames of which %d differ from the last ones of the %d decoded from the start",
+		path, n_threads, seek->frames, differ, all->frames);
+	free(all), free(buf);
+}
+
 static void discard_log(const char *line, void *arg) {}
 
 // Decodes a whole stream single-threaded with the given max_frame_pixels.
@@ -322,14 +426,21 @@ int main(int argc, char *argv[]) {
 	CHECK(edge264mvc_find_start_code(NULL, 5) == 5, "find_start_code(NULL) did not return the size (no start code)");
 	const char *nt = getenv("EDGE264MVC_THREADS");
 	int threads = nt ? atoi(nt) : 4;
-	for (int i = 1; i < argc; i++) {
+	int streams = 1;
+	while (streams < argc && strcmp(argv[streams], "--seek") != 0)
+		streams++;
+	for (int i = 1; i < streams; i++) {
 		check_stream(argv[i], 1);
 		check_stream(argv[i], threads);
 		check_frame_limit(argv[i]);
 	}
-	if (argc > 2) {
-		check_held_frame(argv[argc - 1], argv[1], 1);
-		check_held_frame(argv[argc - 1], argv[1], threads);
+	if (streams > 2) {
+		check_held_frame(argv[streams - 1], argv[1], 1);
+		check_held_frame(argv[streams - 1], argv[1], threads);
+	}
+	for (int i = streams + 1; i < argc; i++) {
+		check_seek(argv[i], 1);
+		check_seek(argv[i], threads);
 	}
 	if (failures) {
 		printf(RED "%d API contract checks FAILED" RESET "\n", failures);

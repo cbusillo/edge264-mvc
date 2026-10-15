@@ -231,8 +231,11 @@ EDGE264MVC_API void edge264mvc_release_frame(Edge264MvcDecoder *decoder, const E
 
 /**
  * Discards every picture and the decoding state, e.g. to seek. Decoding
- * resumes at the next IDR picture or recovery point. Frames already received
- * stay valid until released.
+ * resumes at the next picture sent, an IDR picture or the I picture of a
+ * recovery point. The pictures displayed before such an I picture (the leading
+ * pictures of an open GOP) predict from pictures before it, so they are not
+ * returned, up to the next IDR picture. Frames already received stay valid
+ * until released.
  */
 EDGE264MVC_API void edge264mvc_flush(Edge264MvcDecoder *decoder);
 
